@@ -29,12 +29,15 @@ log = logging.getLogger(__name__)
 
 BILLING_ACCOUNT_ID = os.environ["BILLING_ACCOUNT_ID"]
 STORAGE_ACCOUNT    = os.environ["STORAGE_ACCOUNT_NAME"]
-KV_NAME            = os.environ["KEY_VAULT_NAME"]
+KV_NAME            = os.environ.get("KEY_VAULT_NAME")   # optional when secrets passed directly
 CONTAINER          = "bronze"
 
 
-def get_secret(client: SecretClient, name: str) -> str:
-    return client.get_secret(name).value
+def get_conn_str(cred: DefaultAzureCredential) -> str:
+    if os.environ.get("SQL_CONNECTION_STRING"):
+        return os.environ["SQL_CONNECTION_STRING"]
+    kv = SecretClient(vault_url=f"https://{KV_NAME}.vault.azure.net", credential=cred)
+    return kv.get_secret("sql-connection-string").value
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2))
@@ -183,9 +186,7 @@ def upsert_to_sql(conn_str: str, df: pd.DataFrame, source_file: str) -> None:
 
 def main() -> None:
     cred = DefaultAzureCredential()
-    kv   = SecretClient(vault_url=f"https://{KV_NAME}.vault.azure.net", credential=cred)
-
-    conn_str = get_secret(kv, "sql-connection-string")
+    conn_str = get_conn_str(cred)
     billing_scope = f"/providers/Microsoft.Billing/billingAccounts/{BILLING_ACCOUNT_ID}"
 
     cm_client  = CostManagementClient(credential=cred, subscription_id=None)
@@ -197,7 +198,7 @@ def main() -> None:
     end   = date.today() - timedelta(days=1)
     start = end - timedelta(days=1)          # yesterday; widen window as needed
 
-    log.info("Fetching PEC data %s → %s", start, end)
+    log.info("Fetching PEC data %s to %s", start, end)
     rows = fetch_pec_data(cm_client, billing_scope, start, end)
     if not rows:
         log.warning("No PEC rows returned for %s → %s", start, end)
