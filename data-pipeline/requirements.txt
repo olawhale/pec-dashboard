@@ -4,7 +4,9 @@ azure-mgmt-costmanagement==4.0.1
 azure-keyvault-secrets==4.8.0
 pyodbc==5.1.0
 pandas==2.2.2
-prophet==1.1.5
+numpy<2.0
+cmdstanpy==1.2.4
+prophet==1.1.6
 sqlalchemy==2.0.31
 pyarrow==16.1.0
 python-dotenv==1.0.1

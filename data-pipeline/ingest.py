@@ -34,11 +34,30 @@ KV_NAME            = os.environ.get("KEY_VAULT_NAME")   # optional when secrets 
 CONTAINER          = "bronze"
 
 
+DRIVER = "{ODBC Driver 18 for SQL Server}"
+
+
+def _to_pyodbc(conn_str: str) -> str:
+    if "DRIVER=" in conn_str.upper():
+        return conn_str
+    parts = {k.strip(): v.strip() for k, v in
+             (p.split("=", 1) for p in conn_str.split(";") if "=" in p)}
+    server   = parts.get("Server", parts.get("Data Source", ""))
+    database = parts.get("Database", parts.get("Initial Catalog", ""))
+    uid      = parts.get("User Id", parts.get("UID", ""))
+    pwd      = parts.get("Password", parts.get("PWD", ""))
+    encrypt  = parts.get("Encrypt", "yes")
+    return (
+        f"DRIVER={DRIVER};SERVER={server};DATABASE={database};"
+        f"UID={uid};PWD={pwd};Encrypt={encrypt};TrustServerCertificate=no"
+    )
+
+
 def get_conn_str(cred: DefaultAzureCredential) -> str:
     if os.environ.get("SQL_CONNECTION_STRING"):
-        return os.environ["SQL_CONNECTION_STRING"]
+        return _to_pyodbc(os.environ["SQL_CONNECTION_STRING"])
     kv = SecretClient(vault_url=f"https://{KV_NAME}.vault.azure.net", credential=cred)
-    return kv.get_secret("sql-connection-string").value
+    return _to_pyodbc(kv.get_secret("sql-connection-string").value)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2))
