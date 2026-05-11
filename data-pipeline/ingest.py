@@ -27,7 +27,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-BILLING_ACCOUNT_ID = os.environ["BILLING_ACCOUNT_ID"]
+BILLING_ACCOUNT_ID = os.environ.get("BILLING_ACCOUNT_ID", "")
+SUBSCRIPTION_ID    = os.environ.get("SUBSCRIPTION_ID", "")
 STORAGE_ACCOUNT    = os.environ["STORAGE_ACCOUNT_NAME"]
 KV_NAME            = os.environ.get("KEY_VAULT_NAME")   # optional when secrets passed directly
 CONTAINER          = "bronze"
@@ -43,37 +44,68 @@ def get_conn_str(cred: DefaultAzureCredential) -> str:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2))
 def fetch_pec_data(
     cm_client: CostManagementClient,
-    billing_scope: str,
+    query_scope: str,
     start: date,
     end: date,
 ) -> list[dict]:
-    """Query Cost Management for PEC rows in the given date range."""
+    """Query Cost Management for cost rows.
+
+    At billing-account scope (CSP): PartnerEarnedCreditApplied is available.
+    At subscription scope: falls back to Cost + MeterCategory grouping.
+    """
+    is_sub_scope = "/subscriptions/" in query_scope and "/billingAccounts/" not in query_scope
+
+    if is_sub_scope:
+        aggregation = {
+            "totalCost": {"name": "Cost", "function": "Sum"},
+        }
+        grouping = [
+            {"type": "Dimension", "name": "SubscriptionId"},
+            {"type": "Dimension", "name": "SubscriptionName"},
+            {"type": "Dimension", "name": "ServiceName"},
+            {"type": "Dimension", "name": "MeterCategory"},
+            {"type": "Dimension", "name": "ChargeType"},
+        ]
+    else:
+        aggregation = {
+            "totalCost": {"name": "Cost",                       "function": "Sum"},
+            "pecAmount": {"name": "PartnerEarnedCreditApplied", "function": "Sum"},
+        }
+        grouping = [
+            {"type": "Dimension", "name": "SubscriptionId"},
+            {"type": "Dimension", "name": "SubscriptionName"},
+            {"type": "Dimension", "name": "ServiceName"},
+            {"type": "Dimension", "name": "ServiceFamily"},
+            {"type": "Dimension", "name": "PublisherName"},
+            {"type": "Dimension", "name": "ChargeType"},
+            {"type": "Dimension", "name": "BillingCurrency"},
+        ]
+
     definition = QueryDefinition(
         type=ExportType.ACTUAL_COST,
         timeframe=TimeframeType.CUSTOM,
         time_period=QueryTimePeriod(from_property=start, to=end),
         dataset=QueryDataset(
             granularity="Daily",
-            aggregation={
-                "totalCost":   {"name": "Cost",                    "function": "Sum"},
-                "pecAmount":   {"name": "PartnerEarnedCreditApplied", "function": "Sum"},
-            },
-            grouping=[
-                {"type": "Dimension", "name": "SubscriptionId"},
-                {"type": "Dimension", "name": "SubscriptionName"},
-                {"type": "Dimension", "name": "ServiceName"},
-                {"type": "Dimension", "name": "ServiceFamily"},
-                {"type": "Dimension", "name": "PublisherName"},
-                {"type": "Dimension", "name": "ChargeType"},
-                {"type": "Dimension", "name": "BillingCurrency"},
-            ],
+            aggregation=aggregation,
+            grouping=grouping,
         ),
     )
-    result = cm_client.query.usage(scope=billing_scope, parameters=definition)
+    result = cm_client.query.usage(scope=query_scope, parameters=definition)
     rows = []
     columns = [c.name for c in result.columns]
     for row in result.rows:
-        rows.append(dict(zip(columns, row)))
+        r = dict(zip(columns, row))
+        # Normalise field names so downstream code is consistent
+        if "pecAmount" not in r:
+            r["pecAmount"] = r.get("totalCost", 0)   # treat full cost as proxy PEC
+        if "ServiceFamily" not in r:
+            r["ServiceFamily"] = r.get("MeterCategory", "Unknown")
+        if "PublisherName" not in r:
+            r["PublisherName"] = "Microsoft"
+        if "BillingCurrency" not in r:
+            r["BillingCurrency"] = "USD"
+        rows.append(r)
     return rows
 
 
@@ -187,7 +219,14 @@ def upsert_to_sql(conn_str: str, df: pd.DataFrame, source_file: str) -> None:
 def main() -> None:
     cred = DefaultAzureCredential()
     conn_str = get_conn_str(cred)
-    billing_scope = f"/providers/Microsoft.Billing/billingAccounts/{BILLING_ACCOUNT_ID}"
+
+    # Prefer subscription scope (needs only Cost Management Reader on the sub).
+    # Fall back to billing account scope if SUBSCRIPTION_ID is not set.
+    if SUBSCRIPTION_ID:
+        query_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    else:
+        query_scope = f"/providers/Microsoft.Billing/billingAccounts/{BILLING_ACCOUNT_ID}"
+    log.info("Query scope: %s", query_scope)
 
     cm_client  = CostManagementClient(credential=cred, subscription_id=None)
     adls       = DataLakeServiceClient(
@@ -199,9 +238,9 @@ def main() -> None:
     start = end - timedelta(days=1)          # yesterday; widen window as needed
 
     log.info("Fetching PEC data %s to %s", start, end)
-    rows = fetch_pec_data(cm_client, billing_scope, start, end)
+    rows = fetch_pec_data(cm_client, query_scope, start, end)
     if not rows:
-        log.warning("No PEC rows returned for %s → %s", start, end)
+        log.warning("No PEC rows returned for %s to %s", start, end)
         return
 
     source_path = upload_to_bronze(adls, rows, end)
