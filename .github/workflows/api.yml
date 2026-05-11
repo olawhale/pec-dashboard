@@ -1,0 +1,42 @@
+name: API – Build & Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - '.github/workflows/api.yml'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Read variables
+        id: vars
+        run: |
+          source 00_variables.sh
+          echo "acr=$ACR"           >> $GITHUB_OUTPUT
+          echo "api_app=$API_APP"   >> $GITHUB_OUTPUT
+          echo "rg=$RG"             >> $GITHUB_OUTPUT
+
+      - name: Build and push image
+        run: |
+          az acr build \
+            --registry "${{ steps.vars.outputs.acr }}" \
+            --image "pec-api:${{ github.sha }}" \
+            --image "pec-api:latest" \
+            api/ \
+            --file api/Dockerfile
+
+      - name: Restart App Service
+        run: |
+          az webapp restart \
+            --name "${{ steps.vars.outputs.api_app }}" \
+            --resource-group "${{ steps.vars.outputs.rg }}"
